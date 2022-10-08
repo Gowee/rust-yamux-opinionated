@@ -100,6 +100,7 @@ use crate::{
 use futures::{
     channel::{mpsc, oneshot},
     future::{self, Either},
+    io::BufWriter,
     prelude::*,
     sink::SinkExt,
     stream::{Fuse, FusedStream},
@@ -114,7 +115,7 @@ pub use stream::{Packet, State, Stream};
 ///
 /// Since each `mpsc::Sender` gets a guaranteed slot in a channel the
 /// actual upper bound is this value + number of clones.
-const MAX_COMMAND_BACKLOG: usize = 32;
+const MAX_COMMAND_BACKLOG: usize = 128;
 
 type Result<T> = std::result::Result<T, ConnectionError>;
 
@@ -161,7 +162,7 @@ pub struct Connection<T> {
     id: Id,
     mode: Mode,
     config: Arc<Config>,
-    socket: Fuse<frame::Io<T>>,
+    socket: Fuse<frame::Io<BufWriter<T>>>,
     next_id: u32,
     streams: IntMap<StreamId, Stream>,
     control_sender: mpsc::Sender<ControlCommand>,
@@ -277,7 +278,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
         log::debug!("new connection: {} ({:?})", id, mode);
         let (stream_sender, stream_receiver) = mpsc::channel(MAX_COMMAND_BACKLOG);
         let (control_sender, control_receiver) = mpsc::channel(MAX_COMMAND_BACKLOG);
-        let socket = frame::Io::new(id, socket, cfg.max_buffer_size).fuse();
+        let socket = frame::Io::new(id, BufWriter::new(socket), cfg.max_buffer_size).fuse();
         Connection {
             id,
             mode,
@@ -477,8 +478,14 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
                 future::select(next_stream_command, next_control_command),
                 next_frame,
             );
+            let mut frmcnt = 0;
             match combined_future.await {
-                Either::Left((Either::Left((cmd, _)), _)) => self.on_stream_command(cmd).await?,
+                Either::Left((Either::Left((cmd, _)), _)) => {
+                    if let Some(StreamCommand::SendFrame(ref frame)) = cmd {
+                        frmcnt += 1;
+                    };
+                    self.on_stream_command(cmd).await?
+                }
                 Either::Left((Either::Right((cmd, _)), _)) => self.on_control_command(cmd).await?,
                 Either::Right((frame, _)) => {
                     if let Some(stream) =
@@ -488,6 +495,19 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
                     }
                 }
             }
+            // PATCHED:
+            while let Ok(cmd) = self.stream_receiver.try_next() {
+                if let Some(StreamCommand::SendFrame(_)) = cmd {
+                    frmcnt += 1;
+                }
+                self.on_stream_command(cmd).await?;
+                if frmcnt >= 16 {
+                    // avoid taking too many once
+                    break;
+                }
+            }
+            self.socket.flush().await?;
+            // :PATCHED
         }
     }
 

@@ -22,7 +22,7 @@
 //!
 //! [1]: https://github.com/hashicorp/yamux/blob/master/spec.md
 
-#![forbid(unsafe_code)]
+#![warn(unsafe_code)]
 
 mod chunks;
 mod error;

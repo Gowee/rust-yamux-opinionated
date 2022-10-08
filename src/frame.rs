@@ -56,6 +56,10 @@ impl<T> Frame<T> {
             body: self.body,
         }
     }
+
+    pub fn len(&self) -> usize {
+        12 + self.body.len()
+    }
 }
 
 impl<A: header::private::Sealed> From<Frame<A>> for Frame<()> {
